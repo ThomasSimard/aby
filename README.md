@@ -30,6 +30,12 @@ Then, in pi:
 Prompt templates: `/recap` for where you're at, `/harder` for a tougher variant of
 the last question.
 
+`/mermaid <path>` draws the Mermaid diagrams in a `.md` (or `.mmd`) file as Unicode
+art in the transcript. pi renders mermaid fences that appear in *messages* already;
+this covers the case it cannot see, a diagram sitting in a file — `read` output is a
+tool result, which never passes through pi's markdown transformer. The drawing is a
+custom entry: durable across reloads, never sent to the model.
+
 **Authentication:** pi is bring-your-own-key. Run `/login` inside pi, or set
 `ANTHROPIC_API_KEY`. The provider defaults to `anthropic` in `.pi/settings.json`;
 switch models with `/model` or `Ctrl+L`.
@@ -42,10 +48,12 @@ switch models with `/model` or `Ctrl+L`.
 | Piece | Role |
 |---|---|
 | `extensions/aby.ts` | Registers the nine `aby_*` tools and the five slash commands |
+| `extensions/mermaid.ts` | `/mermaid` — draws a file's Mermaid diagrams in the transcript |
 | `skills/tutor/SKILL.md` | The pedagogy: how to interview, scope nodes, teach and grade |
 | `src/plan.ts` | Decides the next action from stored state — not a model judgement |
 | `src/schedule.ts` | SM-2 spaced repetition and mastery tracking |
 | `src/graph.ts` | DAG validation, DOT/Mermaid emit, graphviz rendering |
+| `src/mermaid.ts` | Mermaid blocks in files: extraction, and the fit-to-width decision |
 | `src/store.ts` | LanceDB tables for profile, skills, nodes, lessons, quiz history |
 | `src/embed.ts` | Local ONNX embeddings (Anthropic has no embeddings endpoint) |
 
