@@ -1,0 +1,9 @@
+# Dependency lifecycle scripts are not run. The prebuilt native binaries shipped
+# in the npm tarballs load fine under the dev shell's LD_LIBRARY_PATH (verified for
+# @lancedb/lancedb and onnxruntime-node), so nothing here needs a postinstall.
+# Flip one to true only if its module actually fails to load.
+allowBuilds:
+  '@google/genai': false
+  onnxruntime-node: false
+  protobufjs: false
+  sharp: false

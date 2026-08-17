@@ -1,0 +1,7 @@
+{
+  "extensions": ["../extensions"],
+  "skills": ["../skills"],
+  "prompts": ["../prompts"],
+  "defaultProvider": "anthropic",
+  "defaultThinkingLevel": "medium"
+}

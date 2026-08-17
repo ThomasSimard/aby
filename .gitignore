@@ -1,0 +1,11 @@
+node_modules/
+
+# direnv's cached dev shell
+.direnv/
+
+# rendered roadmap output
+.aby/
+
+# pi's project-local package installs
+.pi/npm/
+.pi/git/
