@@ -18,15 +18,11 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type {
-  ExtensionAPI,
-  Theme,
-  ThemeColor,
-} from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem, Component } from "@earendil-works/pi-tui";
-import { Box, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import type { Cls } from "grok-mermaid";
-import { extractDiagrams, fitDiagram, type Diagram } from "../src/mermaid.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { extractDiagrams, type Diagram } from "../src/mermaid.ts";
+import { DiagramView } from "./ui/diagram.ts";
 
 const ENTRY_TYPE = "mermaid-view";
 
@@ -39,19 +35,6 @@ type MermaidView = {
   diagrams: Diagram[];
 };
 
-/**
- * Semantic span classes to theme colours — the same mapping pi's built-in
- * transformer uses, so a file diagram and a chat diagram look identical.
- */
-const SPAN_COLOR: Record<Cls, ThemeColor | undefined> = {
-  border: "borderMuted",
-  text: "text",
-  edge: "accent",
-  edgeLabel: "muted",
-  title: "accent",
-  none: undefined,
-};
-
 function expandUser(path: string): string {
   if (path === "~") return homedir();
   if (path.startsWith("~/")) return join(homedir(), path.slice(2));
@@ -61,79 +44,6 @@ function expandUser(path: string): string {
 function displayPath(absolute: string, cwd: string): string {
   const rel = relative(cwd, absolute);
   return rel && !rel.startsWith("..") && !isAbsolute(rel) ? rel : absolute;
-}
-
-/**
- * Draws the diagrams at whatever width the viewport currently has.
- *
- * A component rather than a `Text`: `Text` word-wraps, which would tear the box
- * drawing apart the moment a row exceeded the width. Here an over-wide diagram
- * falls back to its framed source instead.
- */
-class DiagramView implements Component {
-  private diagrams: Diagram[];
-  private theme: Theme;
-  private expanded: boolean;
-  private cache: { width: number; lines: string[] } | undefined;
-
-  constructor(diagrams: Diagram[], theme: Theme, expanded: boolean) {
-    this.diagrams = diagrams;
-    this.theme = theme;
-    this.expanded = expanded;
-  }
-
-  invalidate(): void {
-    this.cache = undefined;
-  }
-
-  render(width: number): string[] {
-    const cached = this.cache;
-    if (cached && cached.width === width) return cached.lines;
-
-    const theme = this.theme;
-    const lines: string[] = [];
-    // A row wider than the viewport would spill past the box and corrupt the
-    // frame, so every line is clamped: art rows fit by construction, but the
-    // source-box fallback and the captions do not always.
-    const push = (line: string) => lines.push(truncateToWidth(line, width, "…"));
-
-    for (const diagram of this.diagrams) {
-      if (lines.length > 0) lines.push("");
-
-      const fit = fitDiagram(diagram.source, width);
-      for (const row of fit.art.styled) {
-        push(
-          row
-            .map((span) => {
-              const color = SPAN_COLOR[span.cls];
-              const text = span.cls === "title" ? theme.bold(span.text) : span.text;
-              return color ? theme.fg(color, text) : text;
-            })
-            .join(""),
-        );
-      }
-
-      if (fit.kind === "source") {
-        push(theme.fg("muted", `  (${fit.reason})`));
-      } else if (fit.art.warnings.length > 0) {
-        // Advisory: the art is still the best drawing of the source. Say what
-        // was dropped so a silently missing edge is not read as a layout bug.
-        const [first = "", ...rest] = fit.art.warnings;
-        const more = rest.length > 0 ? ` (+${rest.length} more)` : "";
-        push(theme.fg("warning", `  ⚠ ${first}${more}`));
-      }
-
-      if (this.expanded) {
-        push(theme.fg("dim", `  line ${diagram.line}`));
-        for (const row of diagram.source.split("\n")) {
-          push(theme.fg("dim", `  ${row}`));
-        }
-      }
-    }
-
-    this.cache = { width, lines };
-    return lines;
-  }
 }
 
 /** Directory listing completion for the path argument. */

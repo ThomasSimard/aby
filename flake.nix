@@ -43,6 +43,11 @@
             # renders the roadmap DAG (dot -Tsvg)
             graphviz
 
+            # aby_check shells out to this for CAS verification. sympy alone covers
+            # both the symbolic and the numeric tier -- N() does the arithmetic --
+            # so numpy/scipy would only enlarge the closure.
+            (python3.withPackages (ps: with ps; [ sympy ]))
+
             fd
             jq
           ];

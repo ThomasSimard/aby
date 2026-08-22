@@ -26,8 +26,15 @@ export const DEFAULT_EASE = 2.5;
 /** A node counts as mastered at or above this. */
 export const MASTERY_THRESHOLD = 0.8;
 
-/** Weight of the newest score when updating mastery. */
-const MASTERY_ALPHA = 0.4;
+/**
+ * Weight of the newest score when updating mastery.
+ *
+ * Exported only so the evidence registry can read it back and catch drift; nothing
+ * outside this module uses it. See src/evidence/bindings/schedule.ts — this value
+ * is bounded by the requirement that four correct answers cross the threshold, and
+ * that requirement is itself unsourced.
+ */
+export const MASTERY_ALPHA = 0.4;
 
 export function initialReview(): Review {
   return { reps: 0, ease: DEFAULT_EASE, intervalDays: 0, dueAt: null };

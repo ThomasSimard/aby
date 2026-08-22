@@ -11,11 +11,14 @@
  * containing a cycle gets fixed without a human in the loop).
  */
 
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   AgentToolResult,
   ExtensionAPI,
+  ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Box, getCapabilities, Image, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   assertValidDag,
@@ -26,6 +29,7 @@ import {
   toMermaid,
   topoOrder,
   writeDotSource,
+  type NodeStatus,
   type RoadmapNode,
 } from "../src/graph.ts";
 import { applyGrade } from "../src/grade.ts";
@@ -45,8 +49,24 @@ import {
   setGoal,
   upsertNodes,
 } from "../src/store.ts";
+import {
+  clip,
+  masteryBar,
+  progressCard,
+  progressRows,
+  relativeDue,
+  STATUS_COLOR,
+  STATUS_MARK,
+  summarize,
+  widgetSegments,
+  type Block,
+  type ProgressCardInput,
+  type Segment,
+} from "../src/view.ts";
+import { MermaidFitView } from "./ui/diagram.ts";
+import { BlockView } from "./ui/paint.ts";
 
-function ok(payload: unknown): AgentToolResult<unknown> {
+function ok<T>(payload: T): AgentToolResult<T> {
   const text =
     typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
   return { content: [{ type: "text", text }], details: payload };
@@ -88,7 +108,241 @@ async function fullState(now: Date) {
   };
 }
 
+// --------------------------------------------------------------- rendering
+
+/**
+ * Two custom *entries*, not custom messages. Entries are durable across a reload
+ * but never enter the model's context, which is what makes /progress genuinely
+ * free: the numbers are for the learner, and the model can call aby_get_profile
+ * when it actually needs them.
+ */
+const PROGRESS_ENTRY = "aby-progress";
+const ROADMAP_ENTRY = "aby-roadmap";
+
+/** One key for every piece of persistent chrome, so a refresh replaces itself. */
+const CHROME_KEY = "aby";
+
+/** A /progress snapshot. `at` is when it was taken; due dates are relative to it. */
+type ProgressEntry = Omit<ProgressCardInput, "now"> & { at: string };
+
+type RoadmapEntry = {
+  /**
+   * The drawing is redone from these on every render, so it reflows on resize
+   * and recolours on a theme change. Both directions are stored because which
+   * one is drawable depends on the terminal's width, not on the roadmap.
+   */
+  mermaid: string;
+  mermaidTall: string;
+  /** Path of the PNG this render produced, when the terminal can show images. */
+  imagePath?: string;
+  headline: string;
+};
+
+/**
+ * base64 PNGs for roadmaps rendered in this session, keyed by path.
+ *
+ * Deliberately not stored in the entry: a session file is JSONL and a roadmap is
+ * re-rendered often, so a ~100KB blob per render would bloat it. After a reload
+ * the cache is empty and the entry falls back to the Unicode art, which is the
+ * durable representation anyway — and the one that works over SSH.
+ */
+const pngCache = new Map<string, string>();
+
+function graphicsAvailable(): boolean {
+  try {
+    return getCapabilities().images !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** The text pi would have shown, for the error path of a custom result renderer. */
+function resultText(result: AgentToolResult<unknown>): string {
+  return result.content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("")
+    .trim();
+}
+
+/**
+ * Goal, mastery and what's due, kept above the editor between turns.
+ *
+ * Rebuilt from the store rather than tracked incrementally: the numbers move
+ * whenever a tool writes, and re-reading is cheaper than being wrong.
+ */
+async function refreshChrome(ctx: ExtensionContext): Promise<void> {
+  if (ctx.mode !== "tui" || !ctx.hasUI) return;
+
+  try {
+    const now = new Date();
+    const [profile, skills, nodes] = await Promise.all([
+      getProfile(),
+      listSkills(),
+      listNodes(),
+    ]);
+
+    if (!profile) {
+      // Nothing to say yet; an empty bar would just be furniture.
+      ctx.ui.setWidget(CHROME_KEY, undefined);
+      ctx.ui.setStatus(CHROME_KEY, undefined);
+      return;
+    }
+
+    const summary = summarize({ profile, skills, nodes, now });
+    ctx.ui.setWidget(
+      CHROME_KEY,
+      (_tui, theme) => new BlockView((w) => widgetSegments(summary, w), theme),
+      { placement: "aboveEditor" },
+    );
+    ctx.ui.setStatus(
+      CHROME_KEY,
+      summary.counts.due > 0 ? `${summary.counts.due} due` : undefined,
+    );
+    ctx.ui.setTitle(`aby — ${summary.goal}`);
+  } catch {
+    // Chrome is a convenience. A store hiccup must not take the session with it.
+  }
+}
+
+/** Where the learner stands, in place of the state dump the model reads. */
+function profileBlock(
+  details: {
+    goal: string | null;
+    roadmap: { status: NodeStatus }[];
+    doThis: string;
+  },
+  width: number,
+): Block {
+  const counts: Record<NodeStatus, number> = {
+    mastered: 0,
+    due: 0,
+    available: 0,
+    locked: 0,
+  };
+  for (const node of details.roadmap) counts[node.status] += 1;
+
+  const tally: Segment[] = [
+    { text: `${details.roadmap.length} nodes`, color: "muted" },
+  ];
+  for (const status of ["mastered", "due", "available", "locked"] as const) {
+    if (counts[status] === 0) continue;
+    tally.push({ text: " · ", color: "dim" });
+    tally.push({ text: `${counts[status]} ${status}`, color: STATUS_COLOR[status] });
+  }
+
+  return [
+    [
+      {
+        text: clip(details.goal ?? "no goal set", width),
+        color: "accent",
+        bold: true,
+      },
+    ],
+    tally,
+    [{ text: clip(details.doThis, width), color: "dim" }],
+  ];
+}
+
+/** The one-line result of a graded answer, in place of the raw JSON. */
+function quizResultBlock(
+  details: {
+    masteryBefore: number;
+    masteryAfter: number;
+    mastered: boolean;
+    lapsed: boolean;
+    nextReviewAt: string | null;
+    doThis: string;
+  },
+  now: Date,
+  width: number,
+): Block {
+  const status = details.lapsed
+    ? "due"
+    : details.mastered
+      ? "mastered"
+      : "available";
+  const color = STATUS_COLOR[status];
+  const head: Segment[] = [
+    { text: STATUS_MARK[status], color },
+    {
+      text: ` ${details.masteryBefore.toFixed(2)} → ${details.masteryAfter.toFixed(2)} `,
+      color: "muted",
+    },
+    { text: masteryBar(details.masteryAfter, 10), color },
+    { text: "  " },
+    {
+      text: details.lapsed
+        ? "lapsed"
+        : `next review ${relativeDue(details.nextReviewAt, now)}`,
+      color: details.lapsed ? "warning" : "muted",
+    },
+  ];
+  return [head, [{ text: clip(details.doThis, width), color: "dim" }]];
+}
+
 export default function (pi: ExtensionAPI) {
+  // -------------------------------------------------------------- transcript
+
+  pi.registerEntryRenderer<ProgressEntry>(
+    PROGRESS_ENTRY,
+    (entry, { expanded }, theme) => {
+      const data = entry.data;
+      if (!data) return undefined;
+
+      const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+      box.addChild(
+        new Text(theme.fg("accent", theme.bold("progress")), 0, 0),
+      );
+      box.addChild(
+        new BlockView(
+          (width) =>
+            progressCard({ ...data, now: new Date(data.at) }, width, expanded),
+          theme,
+        ),
+      );
+      return box;
+    },
+  );
+
+  pi.registerEntryRenderer<RoadmapEntry>(ROADMAP_ENTRY, (entry, _options, theme) => {
+    const data = entry.data;
+    if (!data) return undefined;
+
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(
+      new Text(
+        `${theme.fg("accent", theme.bold("roadmap"))} ${theme.fg("muted", data.headline)}`,
+        0,
+        0,
+      ),
+    );
+
+    const png = data.imagePath ? pngCache.get(data.imagePath) : undefined;
+    if (png) {
+      // maxWidthCells is a ceiling only; Image clamps to the viewport itself.
+      box.addChild(
+        new Image(
+          png,
+          "image/png",
+          { fallbackColor: (s) => theme.fg("dim", s) },
+          { maxWidthCells: 200, maxHeightCells: 30, filename: data.imagePath },
+        ),
+      );
+    } else {
+      box.addChild(new MermaidFitView([data.mermaid, data.mermaidTall], theme));
+    }
+    return box;
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    await refreshChrome(ctx);
+  });
+
+  // Any aby_* tool can move mastery, the due count or the next node.
+  pi.on("tool_execution_end", async (event, ctx) => {
+    if (event.toolName.startsWith("aby_")) await refreshChrome(ctx);
+  });
+
   // ------------------------------------------------------------------ state
 
   pi.registerTool({
@@ -104,6 +358,13 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute() {
       return ok(await fullState(new Date()));
+    },
+    renderResult: (result, _options, theme, context) => {
+      if (context.isError) {
+        return new Text(theme.fg("error", resultText(result)), 0, 0);
+      }
+      const details = result.details;
+      return new BlockView((width) => profileBlock(details, width), theme);
     },
   });
 
@@ -293,13 +554,40 @@ export default function (pi: ExtensionAPI) {
       const dotPath = join(outDir, "roadmap.dot");
 
       const dot = toDot(nodes, now);
+      const mermaid = toMermaid(nodes, now);
+      const mermaidTall = toMermaid(nodes, now, "TD");
       await writeDotSource(dot, dotPath);
       await renderDot(dot, imagePath);
+
+      // The file on disk is for keeping; the entry is what the learner actually
+      // sees. A terminal with a graphics protocol gets the real graph, everyone
+      // else gets the same graph as Unicode art from the mermaid source.
+      let inlinePath: string | undefined;
+      if (graphicsAvailable()) {
+        try {
+          const png = format === "png" ? imagePath : join(outDir, "roadmap.png");
+          if (png !== imagePath) await renderDot(dot, png);
+          pngCache.set(png, (await readFile(png)).toString("base64"));
+          inlinePath = png;
+        } catch {
+          // Fall through to the art: a missing PNG is not worth failing on.
+        }
+      }
+
+      const rows = progressRows(nodes, now);
+      const mastered = rows.filter((r) => r.status === "mastered").length;
+      const due = rows.filter((r) => r.status === "due").length;
+      pi.appendEntry<RoadmapEntry>(ROADMAP_ENTRY, {
+        mermaid,
+        mermaidTall,
+        imagePath: inlinePath,
+        headline: `${mastered}/${rows.length} mastered${due > 0 ? ` · ${due} due` : ""}`,
+      });
 
       return ok({
         image: imagePath,
         dot: dotPath,
-        mermaid: toMermaid(nodes, now),
+        mermaid,
       });
     },
   });
@@ -413,6 +701,19 @@ export default function (pi: ExtensionAPI) {
         doThis: describeAction(action),
       });
     },
+    // The learner is reading over the model's shoulder here; a mastery move and
+    // a next-review date say more than the JSON the model needs.
+    renderResult: (result, _options, theme, context) => {
+      if (context.isError) {
+        return new Text(theme.fg("error", resultText(result)), 0, 0);
+      }
+      const details = result.details;
+      const now = new Date();
+      return new BlockView(
+        (width) => quizResultBlock(details, now, width),
+        theme,
+      );
+    },
   });
 
   // --------------------------------------------------------------- commands
@@ -491,46 +792,24 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const byId = indexById(nodes);
-      const counts = { mastered: 0, due: 0, available: 0, locked: 0 };
-      for (const n of nodes) counts[statusOf(n, byId, now)] += 1;
-
-      const action = nextAction({ profile, skills, nodes, now });
-      const lines = [
-        `Goal: ${profile.goal}`,
-        `Roadmap: ${nodes.length} nodes — ${counts.mastered} mastered, ${counts.due} due, ${counts.available} available, ${counts.locked} locked`,
-        `Assessed topics: ${skills.length} · lessons written: ${lessons.length} · questions answered: ${quiz.length}`,
-        `Next: ${action.reason}`,
-        "",
-        ...topoOrder(nodes).map((n) => {
-          const st = statusOf(n, byId, now);
-          const mark =
-            st === "mastered"
-              ? "✓"
-              : st === "due"
-                ? "↻"
-                : st === "available"
-                  ? "•"
-                  : "🔒";
-          const pct = String(Math.round(n.mastery * 100)).padStart(3);
-          return `  ${mark} ${pct}%  ${n.title}  (${n.id})`;
-        }),
-        "",
-        `Data: ${dataDir()}`,
-      ];
+      const summary = summarize({ profile, skills, nodes, now });
 
       ctx.ui.notify(
-        `${counts.mastered}/${nodes.length} mastered · ${counts.due} due for review`,
+        `${summary.counts.mastered}/${summary.total} mastered · ${summary.counts.due} due for review`,
         "info",
       );
-      await pi.sendMessage(
-        {
-          customType: "aby-progress",
-          content: lines.join("\n"),
-          display: true,
+      pi.appendEntry<ProgressEntry>(PROGRESS_ENTRY, {
+        summary,
+        rows: progressRows(nodes, now),
+        totals: {
+          skills: skills.length,
+          lessons: lessons.length,
+          quiz: quiz.length,
         },
-        { deliverAs: "nextTurn" },
-      );
+        dataDir: dataDir(),
+        at: now.toISOString(),
+      });
+      await refreshChrome(ctx);
     },
   });
 }

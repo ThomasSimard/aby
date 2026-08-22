@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import type { ThemeColor } from "@earendil-works/pi-coding-agent";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { MASTERY_THRESHOLD, isDue, type Review } from "./schedule.ts";
@@ -191,6 +192,27 @@ export function statusOf(
   return ready ? "available" : "locked";
 }
 
+/**
+ * One status, one cell. Deliberately no emoji: a double-width glyph like 🔒
+ * knocks the mastery column out of alignment in the progress card and inflates
+ * the width grok-mermaid computes for a node label.
+ */
+export const STATUS_MARK: Record<NodeStatus, string> = {
+  mastered: "\u2713",
+  due: "\u21bb",
+  available: "\u25b8",
+  locked: "\u00b7",
+};
+
+/** Semantic colour per status, resolved against the active theme by the renderers. */
+export const STATUS_COLOR: Record<NodeStatus, ThemeColor> = {
+  mastered: "success",
+  due: "warning",
+  available: "accent",
+  locked: "dim",
+};
+
+/** Fill colours for the graphviz render, which has no theme to ask. */
 const STATUS_STYLE: Record<NodeStatus, { fill: string; font: string }> = {
   mastered: { fill: "#2f6f4e", font: "#ffffff" },
   due: { fill: "#b8860b", font: "#ffffff" },
@@ -250,25 +272,30 @@ export function toDot(nodes: RoadmapNode[], now: Date): string {
   return lines.join("\n");
 }
 
-/** Mermaid, for rendering inline in the pi transcript where an SVG isn't viewable. */
-export function toMermaid(nodes: RoadmapNode[], now: Date): string {
+/**
+ * Mermaid, for rendering inline in the pi transcript where an SVG isn't viewable.
+ *
+ * Direction matters more here than it does for the image: a left-to-right chain
+ * of eight nodes wants ~200 columns, while the same chain top-down wants ~25. LR
+ * reads as progression and is the default; the viewer falls back to TD when the
+ * drawing would not fit the terminal.
+ */
+export function toMermaid(
+  nodes: RoadmapNode[],
+  now: Date,
+  direction: "LR" | "TD" = "LR",
+): string {
   const byId = indexById(nodes);
   const alias = new Map<string, string>();
   nodes.forEach((n, i) => alias.set(n.id, `n${i}`));
 
-  const lines = ["graph LR"];
-  const marks: Record<NodeStatus, string> = {
-    mastered: "✓",
-    due: "↻",
-    available: "•",
-    locked: "🔒",
-  };
+  const lines = [`graph ${direction}`];
 
   for (const n of topoOrder(nodes)) {
     const a = alias.get(n.id);
     if (!a) continue;
     const st = statusOf(n, byId, now);
-    const label = `${marks[st]} ${n.title}`.replace(/["\]]/g, "");
+    const label = `${STATUS_MARK[st]} ${n.title}`.replace(/["\]]/g, "");
     lines.push(`  ${a}["${label}"]`);
   }
   for (const n of nodes) {
